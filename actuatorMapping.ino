@@ -14,10 +14,18 @@ TableRange tablePitchRange, tableYawRange;
 #define actuator3Forward  4
 #define actuator3Backward 5
 
+// Linear actuator kinematic characteristics
+// Assumes constant acceleration
+// TODO: Find actual neutral length, max speed, and acceleration time from testing
+#define maxSpeed 3 // m/s
+#define accel 3 // m/s^2
+#define accelTime maxSpeed/accel // s
+#define lengthTransient 0.5*accel*pow(accelTime, 2) // m
+
 struct actuator {
-      byte forwardPin, backwardPin;
-      double currentLength, displacement, driveTime;
-      int pwm;
+  byte forwardPin, backwardPin;
+  float currentLength, displacement, driveTime;
+  int pwm;
 };
 
 void setup() {
@@ -36,18 +44,19 @@ void setup() {
   dataTable = SD.open("LengthTable.bin", FILE_WRITE);
   readLengthsFromFile("LengthTable.txt", &dataTable);
   // Explicitly reopening the file as "read" as this file should now remain constant
-  fclose(dataTable);
+  dataTable.close();
   dataTable = SD.open("LengthTable.bin", FILE_READ);
 }
 
 void loop() {
   float lengthInputs[3];
-  getLengths(0f, 0f, lengthInputs, &dataTable); // inputs for getLengths taken from PIDcontrol.ino
+  // getLengths(0f, 0f, lengthInputs, &dataTable); // inputs for getLengths taken from PIDcontrol.ino
+  getLengths(outputang[0], outputang[1], lengthInputs, &dataTable); // inputs for getLengths taken from PIDcontrol.ino
   driveActuators(lengthInputs);
 }
 
 void getLengths(float inputPitch, float inputYaw, float* lengths, File* dataFile) {
-	// Using the input pitch and yaw, and the known table ranges, we calculate the position in the file
+  // Using the input pitch and yaw, and the known table ranges, we calculate the position in the file
   // for which the desired lengths should be located
   // Clamp the pitch and yaw between the max and min
   if (inputPitch > tablePitchRange.max) inputPitch = tablePitchRange.max;
@@ -83,9 +92,9 @@ void getLengths(float inputPitch, float inputYaw, float* lengths, File* dataFile
   }
 }
 
-int compareDriveTimes(const actuator* actuator1, const actuator* actuator2) {
+/*int orderDriveTimes(const actuator* actuator1, const actuator* actuator2) {
   return actuator1->driveTime - actuator2->driveTime;
-}
+}*/
 
 byte actuatorDirection(float displacement, byte forwardPin, byte backwardPin) {
   if (displacement >= 0)
@@ -94,48 +103,49 @@ byte actuatorDirection(float displacement, byte forwardPin, byte backwardPin) {
     return backwardPin;
 }
 
-void driveActuators(float* lengthInputs) {
-  /*  Assume constants are acceleration and max speed, must be experimentally found
-   *  Limitations: error propagates over time since there's no way to check position past initial conditions
-   */ 
-  // Initial conditions
-  static int iteration = 0;
-  // TODO: Find actual max speed and acceleration time
-  float maxSpeed = 3; // m/s
-  float accel = 3; // m/s^2
-  float accelTime = maxSpeed/accel; // s
-  float lengthTransient = 0.5*accel*pow(accelTime, 2); // m
-  actuator actuators[3];
+void driveActuators(float lengthInputs[3]) {
+	/*  Assume constants are acceleration and max speed, must be experimentally found
+	 *  Limitations: error propagates over time since there's no way to check position past initial conditions */
+
+  static int maxDriveTime = 0;
+  static actuator actuators[3] = { { 0, 1, 1, 0, 0 },
+                                   { 2, 3, 1, 0, 0 },
+                                   { 4, 5, 1, 0, 0 } };
 
   for (int i = 0; i <= 2; ++i) {
-    actuators[i].forwardPin = 2 * (i-1);
-    actuators[i].backwardPin = 2*i;
-    if (iteration == 0) {
-      // TODO: Find actual neutral length
-      actuators[i].currentLength = 1; // m, same length for all actuators when motor is straight
-    }
     actuators[i].displacement = lengthInputs[i] - actuators[i].currentLength;
-
+    
     // Calculating drive times for actuators at max power (function of desired length and current length)
     if (lengthInputs[i] >= lengthTransient) {
-      //length1 = currentLength1 + lengthTransient*t/accelTime; // m
+      // Drive time if it's less than the time it takes to accelerate to full speed
       actuators[i].driveTime = abs((lengthInputs[i] - actuators[i].currentLength))*accelTime/lengthTransient*1000; // ms
     } else {
-      // length1 = currentLength1 + lengthTransient + maxSpeed*(t-accelTime); // m
+      // Drive time if it's greater than the time it takes to accelerate to full speed
       actuators[i].driveTime = (abs((lengthInputs[i] - actuators[i].currentLength - lengthTransient))/maxSpeed + accelTime)*1000; // ms
     }
   }
   // Assign drive timings and associated actuators from shortest to longest
-  qsort(actuators, 3, sizeof(actuator), compareDriveTimes);
+  // qsort(actuators, 3, sizeof(actuator), orderDriveTimes);
+  maxDriveTime = max(actuators[0].driveTime, max(actuators[1].driveTime, actuators[2].driveTime));
 
-  // Slowing down the other two actuators to have the same drive time as the longest one
-  for (int i = 0; i <= 1; ++i) {
-    actuators[i].pwm = actuators[i].driveTime/actuators[3].driveTime*255;
+  // Slowing down the other two actuators to have the same drive time as the slowest one
+  for (int i = 0; i <= 2; ++i) {
+    actuators[i].pwm = actuators[i].driveTime/maxDriveTime*255;
     actuators[i].driveTime = actuators[i].driveTime / actuators[i].pwm * 255; // ms
   }
 
+  // Driving actuators
+  for (int i = 0; i <= 2; ++i) {
+    analogWrite(actuatorDirection(actuators[i].displacement, actuators[i].forwardPin, actuators[i].backwardPin), actuators[i].pwm);
+  }
+  delay(maxDriveTime);
+  for (int i = 0; i <= 2; ++i) {
+    analogWrite(actuatorDirection(actuators[i].displacement, actuators[i].forwardPin, actuators[i].backwardPin), 0);
+  }
+
+  /* More accurate but also more computationally demanding method of driving motors
   // Sort by drive time again for stopping the actuators at the right time
-  qsort(actuators, 3, sizeof(actuator), compareDriveTimes);
+  qsort(actuators, 3, sizeof(actuator), orderDriveTimes);
 
   // Driving actuators
   for (int i = 0; i <= 2; ++i) {
@@ -145,12 +155,12 @@ void driveActuators(float* lengthInputs) {
     delay(actuators[i].driveTime);
     analogWrite(actuatorDirection(actuators[i].displacement, actuators[i].forwardPin, actuators[i].backwardPin), 0);
   }
+  */
 
-  // Set initial conditions for next iteration
+  // Set the new lengths as initial conditions for next iteration
   actuators[0].currentLength = lengthInputs[0]; // m
   actuators[1].currentLength = lengthInputs[1]; // m
   actuators[2].currentLength = lengthInputs[2]; // m
-  ++iteration;
 }
 
 void readLengthsFromFile(const char* sourceFileName, File* targetFile) {
@@ -226,7 +236,7 @@ void readLengthsFromFile(const char* sourceFileName, File* targetFile) {
       if (!(currentVar == 0 || currentVar == 1)) {
         // Length, no conversion is needed
         // We ignore angle, as it should come in correctly from the MATLAB
-        targetFile->write((byte)buffer.toInt())
+        targetFile->write((byte)buffer.toInt());
       }
       buffer = "";
       emptyBuffer = true;
